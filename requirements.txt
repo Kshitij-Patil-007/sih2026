@@ -1,0 +1,26 @@
+# Core Dependencies
+streamlit>=1.32.0
+pillow>=10.2.0
+numpy>=1.26.0
+
+# GeoTIFF Processing
+rasterio>=1.3.9
+tifffile>=2024.2.12
+
+# Image Processing
+opencv-python>=4.9.0
+scikit-image>=0.22.0
+
+# Vision AI Options (choose based on your preference)
+# Option 1: Hugging Face Transformers
+transformers>=4.38.0
+torch>=2.2.0
+
+# Option 2: Google Gemini (uncomment if using)
+# google-generativeai>=0.3.0
+
+# Option 3: Anthropic Claude (uncomment if using)
+# anthropic>=0.18.0
+
+# Utilities
+python-dotenv>=1.0.0
