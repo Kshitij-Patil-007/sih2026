@@ -27,6 +27,9 @@ def route_query(question: str):
 
     count_keywords = ['count', 'how many', 'number of', 'quantity', 'total']
 
+    mapping_keywords = ['highlight', 'show me', 'map', 'mark', 'outline', 'detect',
+                        'find', 'locate', 'identify', 'where are', 'where is']
+
     ndvi_keywords = ['vegetation', 'ndvi', 'green', 'forest', 'crop', 'agriculture', 'plant']
 
     # Check for change detection queries
@@ -37,12 +40,20 @@ def route_query(question: str):
             'suggested_action': 'Use detect_changes() with before/after images'
         }
 
+    # Check for feature mapping queries (highlight, detect, find)
+    if any(keyword in question_lower for keyword in mapping_keywords):
+        return {
+            'query_type': 'feature_mapping',
+            'keywords': [kw for kw in mapping_keywords if kw in question_lower],
+            'suggested_action': 'Use detect_and_highlight() to map and highlight features'
+        }
+
     # Check for counting queries
     if any(keyword in question_lower for keyword in count_keywords):
         return {
-            'query_type': 'feature_count',
+            'query_type': 'feature_mapping',
             'keywords': [kw for kw in count_keywords if kw in question_lower],
-            'suggested_action': 'Use vision model with specific counting prompt'
+            'suggested_action': 'Use detect_and_highlight() to count and highlight features'
         }
 
     # Check for NDVI/vegetation analysis
