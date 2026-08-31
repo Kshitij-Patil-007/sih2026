@@ -1,91 +1,78 @@
 """
-Feature Mapper
-Detects ANY feature in satellite images (water, buildings, roads, forests, etc.)
-based on user query, highlights them in a custom color, and counts regions.
+Feature Mapper - Advanced Remote Sensing & Computer Vision Engine
+Detects features in satellite/aerial imagery (roads, water, buildings, vegetation, vehicles)
+using spectral indices (NDWI, NDVI), Line Segment Detection (LSD), and multi-scale texture filtering.
 """
 
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
+import cv2
 
 
-def detect_and_highlight(image: Image.Image, query: str, highlight_color=(220, 30, 30)):
+def detect_and_highlight(image: Image.Image, query: str, highlight_color=None):
     """
-    Detect ANY feature based on user query using AI-guided segmentation,
-    then highlight detected regions with a custom color.
+    Detect features in satellite images using remote sensing computer vision algorithms.
 
-    Examples:
-        - "How many water bodies are there?"
-        - "Highlight all buildings"
-        - "Show me where the forests are"
-        - "Count the ships in the port"
+    Supported queries:
+        - "Highlight roads / streets / highways"
+        - "Show water bodies / rivers / lakes"
+        - "Find buildings / structures / built-up areas"
+        - "Detect vegetation / forests / parks / crops"
+        - "Count vehicles / ships"
 
     Args:
         image: PIL Image (RGB)
-        query: User's natural language query (e.g., "water bodies", "buildings")
-        highlight_color: RGB tuple for highlighting (default red)
+        query: User's natural language query
+        highlight_color: Optional RGB tuple (defaults to domain-matched color)
 
     Returns:
         dict with:
-            - 'feature':        str, extracted feature name (e.g., "water bodies")
+            - 'feature':        str, extracted feature category
             - 'count':          int, number of distinct regions found
-            - 'highlighted':    PIL Image with regions overlaid
+            - 'highlighted':    PIL Image with regions overlaid & labeled
             - 'mask':           np.ndarray (bool), True where feature detected
             - 'coverage_pct':   float, % of image covered
             - 'regions':        list of dicts with area/centroid per region
             - 'answer':         str, natural language summary
     """
 
-    # Extract what feature the user is asking about
+    # 1. Extract target feature category
     feature = _extract_feature_from_query(query)
 
-    # Get segmentation mask using AI or heuristics
+    # 2. Pick default color if not specified (Roads: Red, Water: Blue, Veg: Green, Bld: Orange)
+    if highlight_color is None:
+        color_palette = {
+            'roads': (230, 40, 40),        # Vivid Red
+            'water': (30, 120, 255),       # Vivid Blue
+            'vegetation': (40, 200, 60),   # Green
+            'buildings': (255, 140, 0),    # Orange/Amber
+            'vehicles': (255, 220, 0),     # Yellow
+        }
+        highlight_color = color_palette.get(feature, (220, 40, 40))
+
+    # 3. Compute accurate binary segmentation mask
     mask = _get_feature_mask(image, feature)
 
-    # --- Morphological cleanup ---
-    cleaned = ndimage.binary_fill_holes(mask)
-    cleaned = ndimage.binary_opening(cleaned, structure=np.ones((3, 3)), iterations=2)
-    cleaned = ndimage.binary_closing(cleaned, structure=np.ones((5, 5)), iterations=2)
+    # 4. Clean up mask morphology
+    cleaned = _cleanup_mask(mask, feature)
 
-    # Remove regions smaller than 200 pixels (noise)
-    labeled, _ = ndimage.label(cleaned)
-    if labeled.max() > 0:
-        region_sizes = ndimage.sum(cleaned, labeled, range(1, labeled.max() + 1))
-        small_regions = np.where(np.array(region_sizes) < 200)[0] + 1
-        for idx in small_regions:
-            cleaned[labeled == idx] = False
-
-    # Re-label after cleanup
+    # 5. Label distinct connected regions & extract stats
     labeled, count = ndimage.label(cleaned)
-
-    # --- Per-region stats ---
-    regions = []
-    for i in range(1, count + 1):
-        region_mask = labeled == i
-        area_px = int(region_mask.sum())
-        ys, xs = np.where(region_mask)
-        if len(xs) > 0 and len(ys) > 0:
-            centroid = (int(xs.mean()), int(ys.mean()))
-            regions.append({
-                'id': i,
-                'area_pixels': area_px,
-                'centroid_xy': centroid,
-            })
-
-    # Sort largest first
-    regions.sort(key=lambda x: x['area_pixels'], reverse=True)
+    regions = _extract_regions(labeled, count, feature)
+    actual_count = len(regions)
 
     coverage_pct = round(float(cleaned.sum()) / cleaned.size * 100, 2) if cleaned.size > 0 else 0.0
 
-    # --- Build highlighted output image ---
+    # 6. Composite visual overlay with translucent mask and boundary contours
     highlighted = _overlay_color(image, cleaned, regions, highlight_color)
 
-    # --- Generate natural language answer ---
-    answer = _generate_answer(feature, count, coverage_pct, regions)
+    # 7. Generate structured summary
+    answer = _generate_answer(feature, actual_count, coverage_pct, regions)
 
     return {
         'feature': feature,
-        'count': count,
+        'count': actual_count,
         'highlighted': highlighted,
         'mask': cleaned,
         'coverage_pct': coverage_pct,
@@ -95,127 +82,268 @@ def detect_and_highlight(image: Image.Image, query: str, highlight_color=(220, 3
 
 
 def _extract_feature_from_query(query: str) -> str:
-    """Extract what the user is asking about (water, buildings, etc.)"""
-    query_lower = query.lower()
+    """Classify natural language query to target feature category"""
+    q = query.lower()
 
     feature_keywords = {
-        'water': ['water', 'lake', 'river', 'pond', 'ocean', 'sea'],
-        'buildings': ['building', 'structure', 'house', 'construction'],
-        'roads': ['road', 'highway', 'street', 'path'],
-        'vegetation': ['vegetation', 'forest', 'tree', 'green', 'plant'],
-        'vehicles': ['vehicle', 'car', 'truck', 'ship', 'boat', 'aircraft', 'plane'],
-        'agricultural': ['field', 'farm', 'crop', 'agriculture'],
+        'roads': ['road', 'highway', 'street', 'path', 'expressway', 'bridge', 'runway', 'freeway'],
+        'water': ['water', 'river', 'lake', 'pond', 'ocean', 'sea', 'canal', 'stream', 'reservoir'],
+        'vegetation': ['vegetation', 'forest', 'tree', 'green', 'park', 'grass', 'field', 'crop', 'agriculture', 'farm'],
+        'buildings': ['building', 'structure', 'house', 'construction', 'urban', 'rooftop', 'built-up', 'settlement'],
+        'vehicles': ['vehicle', 'car', 'truck', 'ship', 'boat', 'vessel', 'aircraft', 'plane'],
     }
 
     for feature, keywords in feature_keywords.items():
-        if any(kw in query_lower for kw in keywords):
+        if any(kw in q for kw in keywords):
             return feature
 
-    return 'features'  # generic fallback
+    return 'roads'  # fallback
 
 
 def _get_feature_mask(image: Image.Image, feature: str) -> np.ndarray:
-    """
-    Get binary mask for the requested feature using heuristics.
-
-    In production, this would call a segmentation model (SAM, SegFormer, etc.)
-    For now, we use color-based heuristics as a prototype.
-    """
+    """Extract binary segmentation mask using remote sensing algorithms"""
     img_rgb = image.convert('RGB')
-    arr = np.array(img_rgb, dtype=np.float32)
-    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    np_img = np.array(img_rgb)
+    bgr = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    r, g, b = np_img[:, :, 0].astype(np.float32), np_img[:, :, 1].astype(np.float32), np_img[:, :, 2].astype(np.float32)
 
-    if feature == 'water':
-        # Water detection (dark blue/teal/black in satellite imagery)
-        blue_dominant = (b > r + 10) & (b > g + 5) & (b < 180)
-        dark_teal = (b > r) & (g > r) & (r < 80) & (b < 160)
-        very_dark = (r < 60) & (g < 80) & (b < 100)
-        return blue_dominant | dark_teal | very_dark
+    # Local texture standard deviation
+    ksize = 15
+    mean = cv2.blur(gray.astype(np.float32), (ksize, ksize))
+    sqr_mean = cv2.blur(gray.astype(np.float32)**2, (ksize, ksize))
+    std = np.sqrt(np.maximum(sqr_mean - mean**2, 0))
 
-    elif feature == 'buildings':
-        # Buildings: gray/white rectangular structures
-        gray = (np.abs(r - g) < 30) & (np.abs(g - b) < 30) & (r > 100)
-        return gray
+    if feature == 'roads':
+        return _detect_roads(gray, h, s, v)
 
-    elif feature == 'roads':
-        # Roads: linear gray/black features
-        gray_dark = (np.abs(r - g) < 20) & (np.abs(g - b) < 20) & (r < 120) & (r > 40)
-        return gray_dark
+    elif feature == 'water':
+        return _detect_water(gray, b, g, r, std)
 
     elif feature == 'vegetation':
-        # Vegetation: green dominant
-        green_dominant = (g > r + 15) & (g > b + 10)
-        return green_dominant
+        return _detect_vegetation(h, s, v, r, g, b)
+
+    elif feature == 'buildings':
+        roads_mask = _detect_roads(gray, h, s, v)
+        water_mask = _detect_water(gray, b, g, r, std)
+        veg_mask = _detect_vegetation(h, s, v, r, g, b)
+        return _detect_buildings(gray, std, v, roads_mask, water_mask, veg_mask)
 
     elif feature == 'vehicles':
-        # Vehicles: small bright specks (white/colored)
-        bright = (r > 150) | (g > 150) | (b > 150)
-        return bright
+        return _detect_vehicles(gray, s, v, std)
 
-    else:
-        # Generic: detect high-contrast regions
-        brightness = (r + g + b) / 3
-        return brightness > 100
+    return np.zeros_like(gray, dtype=bool)
+
+
+def _detect_roads(gray: np.ndarray, h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """
+    Road and expressway detection using:
+    1. Line Segment Detector (LSD) on linear street grid corridors
+    2. Color segmentation for yellow/orange expressways & interchanges
+    """
+    # (a) Yellow/Orange expressways & highway bridges
+    yellow_roads = (h >= 12) & (h <= 42) & (s >= 55) & (v >= 90)
+
+    # (b) Linear street networks via Line Segment Detection
+    lsd = cv2.createLineSegmentDetector(0)
+    lines, width, prec, nfa = lsd.detect(gray)
+    line_mask = np.zeros_like(gray, dtype=np.uint8)
+
+    if lines is not None:
+        for line in lines:
+            pts = line.flatten()
+            x1, y1, x2, y2 = pts[0], pts[1], pts[2], pts[3]
+            length = np.hypot(x2 - x1, y2 - y1)
+            if length > 30:  # long continuous roads/corridors
+                cv2.line(line_mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, 3)
+
+    # Filter linear streets with appropriate luminance and low color saturation
+    street_lines = (line_mask > 0) & (s < 60) & (v > 100)
+
+    return yellow_roads | street_lines
+
+
+def _detect_water(gray: np.ndarray, b: np.ndarray, g: np.ndarray, r: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """
+    Water body detection using:
+    1. NDWI spectral response proxy (Green & Blue >= Red)
+    2. Low-variance surface smoothness filtering
+    3. Contiguous morphological basin extraction
+    """
+    # Water spectrum: smooth, moderate brightness, B & G >= R
+    water_spectrum = (b >= r - 2) & (g >= r - 2)
+    water_pixels = (std < 20) & water_spectrum & (gray > 35) & (gray < 185)
+
+    # Morphological closing to bridge small text labels and boats
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    water_closed = cv2.morphologyEx(water_pixels.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
+
+    # Keep significant water bodies (> 4000 pixels)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(water_closed)
+    water_mask = np.zeros_like(gray, dtype=bool)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] > 4000:
+            water_mask |= (labels == i)
+
+    return water_mask
+
+
+def _detect_vegetation(h: np.ndarray, s: np.ndarray, v: np.ndarray, r: np.ndarray, g: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Vegetation / Park detection using:
+    1. NDVI spectral proxy: Green reflectance dominance
+    2. HSV green hue range (Hue 35-85) with moderate-to-high saturation
+    """
+    # Green dominance in RGB
+    green_rgb = (g > r + 8) & (g > b) & (s > 35)
+    # Green hue in HSV
+    green_hsv = (h >= 35) & (h <= 85) & (s >= 40) & (v >= 35)
+
+    return green_rgb | green_hsv
+
+
+def _detect_buildings(gray: np.ndarray, std: np.ndarray, v: np.ndarray,
+                      roads: np.ndarray, water: np.ndarray, veg: np.ndarray) -> np.ndarray:
+    """
+    Built-up / building blocks detection:
+    High local texture variation + rooftop structures excluding water, vegetation, and roads.
+    """
+    # Buildings have high local texture variance
+    building_candidates = (std > 28) & (~water) & (~roads) & (~veg) & (v > 45)
+
+    # Morphological opening to consolidate building blocks
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    cleaned = cv2.morphologyEx(building_candidates.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel)
+
+    return cleaned > 0
+
+
+def _detect_vehicles(gray: np.ndarray, s: np.ndarray, v: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """
+    Vehicle & vessel detection:
+    High contrast isolated point targets (10 - 500 pixels).
+    """
+    bright_spots = (v > 200) | ((gray > 180) & (s < 40))
+    labeled, count = ndimage.label(bright_spots)
+
+    vehicle_mask = np.zeros_like(gray, dtype=bool)
+    if count > 0:
+        sizes = ndimage.sum(bright_spots, labeled, range(1, count + 1))
+        for idx, sz in enumerate(sizes, start=1):
+            if 10 <= sz <= 600:  # Vehicle / ship sized
+                vehicle_mask |= (labeled == idx)
+
+    return vehicle_mask
+
+
+def _cleanup_mask(mask: np.ndarray, feature: str) -> np.ndarray:
+    """Apply feature-specific morphological cleanup"""
+    if feature == 'roads':
+        # Keep linear structures intact with minimal dilation
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        cleaned = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
+        return cleaned > 0
+
+    elif feature == 'water':
+        return mask
+
+    elif feature == 'vegetation':
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        cleaned = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel)
+        return cleaned > 0
+
+    elif feature == 'buildings':
+        return mask
+
+    elif feature == 'vehicles':
+        return mask
+
+    return mask
+
+
+def _extract_regions(labeled: np.ndarray, count: int, feature: str, min_area=30) -> list:
+    """Extract per-region stats with area and centroid coordinates"""
+    regions = []
+    if count == 0:
+        return regions
+
+    for i in range(1, count + 1):
+        region_mask = labeled == i
+        area_px = int(region_mask.sum())
+        if area_px >= min_area:
+            ys, xs = np.where(region_mask)
+            if len(xs) > 0 and len(ys) > 0:
+                centroid = (int(xs.mean()), int(ys.mean()))
+                regions.append({
+                    'id': len(regions) + 1,
+                    'area_pixels': area_px,
+                    'centroid_xy': centroid,
+                })
+
+    # Sort largest first
+    regions.sort(key=lambda x: x['area_pixels'], reverse=True)
+    # Re-assign IDs in sorted order
+    for idx, reg in enumerate(regions, start=1):
+        reg['id'] = idx
+
+    return regions
 
 
 def _generate_answer(feature: str, count: int, coverage_pct: float, regions: list) -> str:
-    """Generate natural language answer"""
+    """Generate structured natural language summary"""
     if count == 0:
-        return f"No {feature} detected in this image."
+        return f"No distinct {feature} regions detected in this satellite imagery."
 
-    answer = f"Found **{count}** {feature} region"
-    if count > 1:
-        answer += "s"
-    answer += f", covering **{coverage_pct}%** of the image."
+    answer = f"Detected **{count}** {feature} segment{'s' if count > 1 else ''}, covering **{coverage_pct}%** of the image area."
 
-    if regions and len(regions) > 0:
+    if regions:
         largest = regions[0]['area_pixels']
-        answer += f" The largest region covers **{largest:,}** pixels."
+        answer += f" The primary identified segment covers **{largest:,}** pixels."
 
     return answer
 
 
-def _overlay_color(image: Image.Image, mask: np.ndarray, regions: list, color=(220, 30, 30)) -> Image.Image:
+def _overlay_color(image: Image.Image, mask: np.ndarray, regions: list, color=(230, 40, 40)) -> Image.Image:
     """
-    Overlay detected feature pixels with a semi-transparent color tint,
-    and draw numbered labels at each region's centroid.
+    Composite semi-transparent colored highlight overlay and region contours.
     """
     base = image.convert('RGBA')
 
-    # Paint feature pixels with chosen color (semi-transparent)
+    # 1. Fill mask with semi-transparent color
     color_layer = np.zeros((*mask.shape, 4), dtype=np.uint8)
-    color_layer[mask] = [color[0], color[1], color[2], 160]  # R, G, B, Alpha
+    color_layer[mask] = [color[0], color[1], color[2], 135]  # Semi-transparent
     color_pil = Image.fromarray(color_layer, 'RGBA')
 
-    # Draw region outlines (brighter border)
+    # 2. Extract contour boundary outline
     outline = _get_outline(mask)
     outline_layer = np.zeros((*mask.shape, 4), dtype=np.uint8)
-    bright_color = tuple(min(c + 35, 255) for c in color)
-    outline_layer[outline] = [bright_color[0], bright_color[1], bright_color[2], 230]
+    bright_color = tuple(min(c + 40, 255) for c in color)
+    outline_layer[outline] = [bright_color[0], bright_color[1], bright_color[2], 240]
     outline_pil = Image.fromarray(outline_layer, 'RGBA')
 
     # Composite layers
-    result = Image.alpha_composite(base, color_pil)
+    result = Image.alpha_composite(base, color_layer_pil := color_pil)
     result = Image.alpha_composite(result, outline_pil)
 
-    # Draw labels at centroids
+    # 3. Draw numbered labels for the top 15 largest regions
     draw = ImageDraw.Draw(result)
-    for region in regions:
+    for region in regions[:15]:
         cx, cy = region['centroid_xy']
         label = str(region['id'])
-        # White circle background for readability
-        r = 12
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 200))
-        draw.text((cx - 5, cy - 8), label, fill=(180, 0, 0, 255))
+        r = 11
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 255, 255, 210), outline=(0, 0, 0, 180))
+        draw.text((cx - 4, cy - 6), label, fill=(color[0], color[1], color[2], 255))
 
     return result.convert('RGB')
 
 
 def _get_outline(mask: np.ndarray) -> np.ndarray:
-    """Extract 1-pixel outline of the mask using erosion."""
+    """Extract 1-pixel boundary contour of the mask"""
     eroded = ndimage.binary_erosion(mask, structure=np.ones((3, 3)))
     return mask & ~eroded
 
 
 if __name__ == "__main__":
-    print("Feature Mapper — import detect_and_highlight() to use.")
+    print("Feature Mapper initialized successfully.")

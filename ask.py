@@ -22,9 +22,9 @@ load_dotenv()
 
 # Keywords that trigger the feature mapper (highlight/count mode)
 MAPPING_KEYWORDS = [
-    'highlight', 'show me', 'map', 'mark', 'outline',
+    'highlight', 'show me', 'show', 'map', 'mark', 'outline',
     'how many', 'count', 'detect', 'find', 'locate', 'identify',
-    'where are', 'where is',
+    'where are', 'where is', 'segment', 'isolate'
 ]
 
 # Feature color mapping for different features

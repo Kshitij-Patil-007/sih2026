@@ -15,12 +15,13 @@ scikit-image>=0.22.0
 # Option 1: Hugging Face Transformers
 transformers>=4.38.0
 torch>=2.2.0
+scipy>=1.11.0
 
-# Option 2: Google Gemini (uncomment if using)
-# google-generativeai>=0.3.0
+# Option 2: Google Gemini (API-based)
+google-generativeai>=0.3.0
 
-# Option 3: Anthropic Claude (uncomment if using)
-# anthropic>=0.18.0
+# Option 3: Anthropic Claude (API-based)
+anthropic>=0.18.0
 
 # Utilities
 python-dotenv>=1.0.0
