@@ -3,6 +3,9 @@ FastAPI Main Server
 Provides REST API for satellite image Q&A with agentic routing
 """
 
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +22,7 @@ from backend.router import route_query
 from backend.geo_loader import load_geotiff
 from backend.vlm_engine import ask_vision_model
 from backend.change_detection import detect_changes
+from backend.feature_mapper import detect_and_highlight
 
 app = FastAPI(title="SatQuery AI API", version="1.0.0")
 
@@ -51,29 +55,57 @@ class UploadResponse(BaseModel):
     session_id: str
     images: List[ImageMetadata]
 
+class VisualEvidence(BaseModel):
+    type: str  # "feature_mask", "change_mask", "bbox", etc.
+    data: Optional[str] = None  # base64 or URL
+    url: Optional[str] = None  # URL to highlighted image
+    count: Optional[int] = None
+    coverage_pct: Optional[float] = None
+
+class AuditTrail(BaseModel):
+    task: str
+    models_used: List[str]
+    parameters: dict
+    routing_decision: Optional[str] = None
+    preprocessing_steps: Optional[List[str]] = None
+
 class QueryResponse(BaseModel):
-    query_id: str
     task: str
     answer: str
     confidence: Optional[float]
-    visual_evidence: Optional[dict]
-    audit_trail: List[dict]
+    visual_evidence: Optional[VisualEvidence]
+    audit_trail: AuditTrail
 
+
+HTML_FILE = Path(__file__).parent / "test_upload.html"
 
 @app.get("/")
 def root():
-    """Health check"""
+    """Serve the Web UI test interface"""
+    if HTML_FILE.exists():
+        return FileResponse(HTML_FILE)
+    return {"status": "online", "service": "SatQuery AI"}
+
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
     return {"status": "online", "service": "SatQuery AI"}
 
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_images(
-    files: List[UploadFile] = File(...),
-    modality_hints: Optional[str] = Form(None)  # JSON string: ["optical", "sar"]
+    files: List[UploadFile] = File(..., description="Select 1-2 satellite images (PNG, JPEG, or GeoTIFF)"),
+    modality_hints: Optional[str] = Form(None, description='Optional JSON array like ["optical", "sar"]')
 ):
     """
     Upload 1-2 satellite images
     Returns session_id for subsequent queries
+
+    **Note:** Swagger UI doesn't handle multiple file uploads well.
+    **Use the test page instead:** Open `test_upload.html` in your browser for the best experience.
+
+    **Accepted formats:** PNG, JPEG, GeoTIFF (.tif, .tiff)
     """
     if len(files) < 1 or len(files) > 2:
         raise HTTPException(status_code=400, detail="Must upload 1 or 2 images")
@@ -150,6 +182,82 @@ async def upload_images(
     return UploadResponse(session_id=session_id, images=images_metadata)
 
 
+@app.post("/upload-simple")
+async def upload_simple(
+    file: UploadFile = File(..., description="Single satellite image for testing in Swagger UI")
+):
+    """
+    **Simplified upload endpoint for testing in Swagger UI**
+
+    Upload a single satellite image and get a session_id.
+    This endpoint works better in Swagger UI than the multi-file /upload endpoint.
+
+    For production use with 1-2 images, use /upload or the test_upload.html page.
+    """
+    # Validate file format
+    valid_formats = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+    ext = Path(file.filename).suffix.lower()
+    if ext not in valid_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid format: {file.filename}. Allowed: PNG, JPEG, GeoTIFF"
+        )
+
+    # Create session
+    session_id = db.create_session(1)
+    session_dir = UPLOAD_DIR / session_id
+    session_dir.mkdir(exist_ok=True)
+
+    # Save file
+    filepath = session_dir / file.filename
+    with filepath.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Get image dimensions
+    try:
+        if filepath.suffix.lower() in [".tif", ".tiff"]:
+            geo_data = load_geotiff(str(filepath))
+            img = geo_data["image"]
+        else:
+            img = Image.open(filepath)
+
+        width, height = img.size
+        format_type = filepath.suffix.lower().replace(".", "")
+
+        # Auto-detect modality
+        if img.mode == "L" or (hasattr(img, "getbands") and len(img.getbands()) == 1):
+            modality = "sar"
+        else:
+            modality = "optical"
+
+        # Store in database
+        image_id = db.add_image(
+            session_id=session_id,
+            filename=file.filename,
+            filepath=str(filepath),
+            modality=modality,
+            format=format_type,
+            width=width,
+            height=height
+        )
+
+        return {
+            "session_id": session_id,
+            "image": {
+                "id": image_id,
+                "modality": modality,
+                "format": format_type,
+                "width": width,
+                "height": height,
+                "preview_url": f"/uploads/{session_id}/{file.filename}"
+            },
+            "note": "Use this session_id with /query endpoint"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to process {file.filename}: {str(e)}")
+
+
 @app.post("/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
     """
@@ -204,19 +312,60 @@ async def process_query(request: QueryRequest):
             visual_evidence=result.get("visual_evidence")
         )
 
-        # Get formatted audit trail
-        audit_trail = audit.format_audit_trail_for_ui(query_id)
+        # Build audit trail in the format required by the API contract
+        audit_trail_data = audit.get_audit_trail(query_id)
+
+        models_used = []
+        preprocessing_steps = []
+        parameters = {}
+
+        for entry in audit_trail_data:
+            if entry["event_type"] == "model_call":
+                if entry.get("model_used"):
+                    models_used.append(entry["model_used"])
+                if entry.get("parameters") and isinstance(entry["parameters"], dict):
+                    parameters.update(entry["parameters"])
+            elif entry["event_type"] == "preprocessing":
+                if entry.get("details"):
+                    preprocessing_steps.append(entry["details"])
+
+        audit_trail = AuditTrail(
+            task=task_type,
+            models_used=models_used if models_used else ["gemini"],
+            parameters=parameters if parameters else {"query": request.query_text},
+            routing_decision=routing_result.get("suggested_action"),
+            preprocessing_steps=preprocessing_steps if preprocessing_steps else None
+        )
+
+        # Format visual evidence if present
+        visual_evidence = None
+        if result.get("visual_evidence"):
+            ve = result["visual_evidence"]
+            # Ensure ve is a dict
+            if isinstance(ve, dict):
+                visual_evidence = VisualEvidence(
+                    type=ve.get("type", "unknown"),
+                    data=ve.get("data"),
+                    url=ve.get("url"),
+                    count=ve.get("count"),
+                    coverage_pct=ve.get("coverage_pct")
+                )
+            else:
+                print(f"WARNING: visual_evidence is not a dict, it's: {type(ve)} = {ve}")
+                visual_evidence = VisualEvidence(type="unknown")
 
         return QueryResponse(
-            query_id=query_id,
             task=task_type,
             answer=result["answer"],
             confidence=result.get("confidence"),
-            visual_evidence=result.get("visual_evidence"),
+            visual_evidence=visual_evidence,
             audit_trail=audit_trail
         )
 
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"ERROR in /query: {error_trace}")
         audit.log_event(query_id, "error", details=str(e))
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
@@ -253,6 +402,17 @@ async def generate_report(query_id: str):
         "audit_trail": audit_trail,
         "note": "PDF generation pending - Yatharth's task"
     })
+
+
+@app.get("/uploads/{session_id}/{filename}")
+async def serve_uploaded_image(session_id: str, filename: str):
+    """Serve uploaded images for display in browser"""
+    filepath = UPLOAD_DIR / session_id / filename
+
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(filepath)
 
 
 # Helper functions for different task types
@@ -298,9 +458,42 @@ async def handle_vqa(query_id: str, image_info: dict, question: str) -> dict:
 
 async def handle_feature_mapping(query_id: str, image_info: dict, question: str) -> dict:
     """Handle feature detection/mapping"""
-    # This would call feature_mapper.py logic
-    # For now, delegate to VQA
-    return await handle_vqa(query_id, image_info, question)
+    filepath = image_info["filepath"]
+
+    audit.log_preprocessing(query_id, "feature_detection", f"Detecting features: {question}")
+
+    # Load image
+    if filepath.endswith((".tif", ".tiff")):
+        geo_data = load_geotiff(filepath)
+        img = geo_data["image"]
+    else:
+        img = Image.open(filepath)
+
+    # Use feature mapper to detect and highlight
+    audit.log_model_call(query_id, "feature-mapper", "feature_detection",
+                        {"image": filepath, "query": question}, success=True)
+
+    result = detect_and_highlight(img, question)
+
+    # Save the highlighted image
+    output_filename = f"highlighted_{Path(filepath).name}"
+    output_path = Path(filepath).parent / output_filename
+    result['highlighted'].save(output_path)
+
+    # Get session_id from filepath to build URL
+    session_id = Path(filepath).parent.name
+
+    return {
+        "answer": result['answer'],
+        "confidence": 0.85,
+        "visual_evidence": {
+            "type": "feature_mask",
+            "path": str(output_path),
+            "url": f"/uploads/{session_id}/{output_filename}",
+            "count": result['count'],
+            "coverage_pct": result['coverage_pct']
+        }
+    }
 
 
 async def handle_change_detection(query_id: str, images: List[dict], question: str) -> dict:

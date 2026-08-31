@@ -324,7 +324,7 @@ def _overlay_color(image: Image.Image, mask: np.ndarray, regions: list, color=(2
     outline_pil = Image.fromarray(outline_layer, 'RGBA')
 
     # Composite layers
-    result = Image.alpha_composite(base, color_layer_pil := color_pil)
+    result = Image.alpha_composite(base, color_pil)
     result = Image.alpha_composite(result, outline_pil)
 
     # 3. Draw numbered labels for the top 15 largest regions

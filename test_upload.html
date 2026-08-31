@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SatQuery API Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        .section {
+            margin: 30px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        input[type="file"] {
+            margin: 10px 0;
+            padding: 10px;
+            width: 100%;
+        }
+        textarea {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .result {
+            background: #f9f9f9;
+            padding: 15px;
+            margin-top: 15px;
+            border-radius: 4px;
+            border-left: 4px solid #4CAF50;
+        }
+        .error {
+            border-left-color: #f44336;
+            background: #ffebee;
+        }
+        pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        .session-id {
+            background: #fff3cd;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        .image-preview {
+            margin: 15px 0;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .image-preview img {
+            max-width: 300px;
+            max-height: 300px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            object-fit: contain;
+        }
+        .image-preview .image-info {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🛰️ SatQuery API Test</h1>
+        <p>Test your backend API without using /docs</p>
+
+        <!-- Step 1: Upload Images -->
+        <div class="section">
+            <h2>Step 1: Upload Images</h2>
+            <input type="file" id="imageFiles" accept="image/*,.tif,.tiff" multiple>
+            <button onclick="uploadImages()">Upload Images</button>
+            <div id="uploadResult"></div>
+        </div>
+
+        <!-- Step 2: Query -->
+        <div class="section">
+            <h2>Step 2: Ask a Question</h2>
+            <label>Session ID (from Step 1):</label>
+            <input type="text" id="sessionId" placeholder="Will auto-fill after upload" style="width: 100%; padding: 8px; margin: 10px 0;">
+
+            <label>Your Question:</label>
+            <textarea id="queryText" rows="3" placeholder="What do you see in this satellite image?">What do you see in this satellite image?</textarea>
+
+            <button onclick="sendQuery()" id="queryBtn" disabled>Send Query</button>
+            <div id="queryResult"></div>
+        </div>
+
+        <!-- Step 3: Try More Queries -->
+        <div class="section">
+            <h2>Step 3: Try Different Questions</h2>
+            <button onclick="setQuery('Describe the land cover types visible')">Land Cover Types</button>
+            <button onclick="setQuery('Are there any buildings or urban structures?')">Buildings</button>
+            <button onclick="setQuery('What changed between these images?')">Changes (2 images)</button>
+            <button onclick="setQuery('What percentage is water?')">Water Percentage</button>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000';
+
+        async function uploadImages() {
+            const fileInput = document.getElementById('imageFiles');
+            const resultDiv = document.getElementById('uploadResult');
+
+            if (!fileInput.files || fileInput.files.length === 0) {
+                resultDiv.innerHTML = '<div class="result error">Please select at least one image file</div>';
+                return;
+            }
+
+            if (fileInput.files.length > 2) {
+                resultDiv.innerHTML = '<div class="result error">Maximum 2 images allowed</div>';
+                return;
+            }
+
+            const formData = new FormData();
+            for (let file of fileInput.files) {
+                formData.append('files', file);
+            }
+
+            resultDiv.innerHTML = '<div class="result">Uploading...</div>';
+
+            try {
+                const response = await fetch(`${API_BASE}/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    document.getElementById('sessionId').value = data.session_id;
+                    document.getElementById('queryBtn').disabled = false;
+
+                    // Build image preview HTML
+                    const imagePreviewHTML = data.images.map((img, idx) => {
+                        const filename = fileInput.files[idx].name;
+                        const imageUrl = `${API_BASE}/uploads/${data.session_id}/${filename}`;
+                        return `
+                            <div>
+                                <img src="${imageUrl}" alt="${filename}" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+                                <div class="image-info" style="display:none;">⚠️ Preview not available for ${img.format.toUpperCase()}</div>
+                                <div class="image-info">${img.modality} • ${img.width}×${img.height} • ${img.format}</div>
+                            </div>
+                        `;
+                    }).join('');
+
+                    resultDiv.innerHTML = `
+                        <div class="result">
+                            <strong>✓ Upload Successful!</strong>
+                            <div class="session-id">Session ID: ${data.session_id}</div>
+                            <p><strong>Uploaded ${data.images.length} image(s):</strong></p>
+                            <div class="image-preview">${imagePreviewHTML}</div>
+                        </div>
+                    `;
+                } else {
+                    resultDiv.innerHTML = `<div class="result error"><strong>Error:</strong> ${JSON.stringify(data, null, 2)}</div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="result error"><strong>Error:</strong> ${error.message}</div>`;
+            }
+        }
+
+        async function sendQuery() {
+            const sessionId = document.getElementById('sessionId').value;
+            const queryText = document.getElementById('queryText').value;
+            const resultDiv = document.getElementById('queryResult');
+
+            if (!sessionId) {
+                resultDiv.innerHTML = '<div class="result error">Please upload images first (Step 1)</div>';
+                return;
+            }
+
+            if (!queryText) {
+                resultDiv.innerHTML = '<div class="result error">Please enter a question</div>';
+                return;
+            }
+
+            resultDiv.innerHTML = '<div class="result">Processing... (this may take 5-10 seconds)</div>';
+
+            try {
+                const response = await fetch(`${API_BASE}/query`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        query_text: queryText
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    // Build visual evidence section if available
+                    let visualEvidenceHTML = '';
+                    if (data.visual_evidence && data.visual_evidence.url) {
+                        visualEvidenceHTML = `
+                            <p><strong>Visual Evidence:</strong></p>
+                            <div class="image-preview">
+                                <div>
+                                    <img src="${API_BASE}${data.visual_evidence.url}" alt="Highlighted result">
+                                    <div class="image-info">
+                                        ${data.visual_evidence.count ? `Found: ${data.visual_evidence.count} features` : ''}
+                                        ${data.visual_evidence.coverage_pct ? ` • Coverage: ${data.visual_evidence.coverage_pct.toFixed(1)}%` : ''}
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }
+
+                    resultDiv.innerHTML = `
+                        <div class="result">
+                            <strong>✓ Query Successful!</strong>
+                            <p><strong>Task Type:</strong> ${data.task}</p>
+                            <p><strong>Answer:</strong></p>
+                            <pre>${data.answer}</pre>
+                            ${data.confidence ? `<p><strong>Confidence:</strong> ${(data.confidence * 100).toFixed(0)}%</p>` : ''}
+                            ${visualEvidenceHTML}
+                            <details>
+                                <summary>View Audit Trail</summary>
+                                <pre><strong>Task:</strong> ${data.audit_trail.task}
+<strong>Models Used:</strong> ${data.audit_trail.models_used.join(', ')}
+<strong>Routing Decision:</strong> ${data.audit_trail.routing_decision || 'N/A'}
+${data.audit_trail.preprocessing_steps ? '<strong>Preprocessing:</strong> ' + data.audit_trail.preprocessing_steps.join(', ') : ''}
+<strong>Parameters:</strong> ${JSON.stringify(data.audit_trail.parameters, null, 2)}</pre>
+                            </details>
+                        </div>
+                    `;
+                } else {
+                    resultDiv.innerHTML = `<div class="result error"><strong>Error:</strong> ${JSON.stringify(data, null, 2)}</div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="result error"><strong>Error:</strong> ${error.message}</div>`;
+            }
+        }
+
+        function setQuery(text) {
+            document.getElementById('queryText').value = text;
+        }
+    </script>
+</body>
+</html>

@@ -52,21 +52,48 @@ def ask_vision_model(image, question: str, model_type="placeholder"):
 def _call_gemini(image, question):
     """Call Google Gemini Vision API"""
     try:
-        import google.generativeai as genai
         import os
 
-        # Configure API (set GOOGLE_API_KEY in environment)
-        genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
+        # Try new google.genai package first, fallback to deprecated google.generativeai
+        try:
+            from google import genai
+            client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
-        model = genai.GenerativeModel('gemini-3.6-flash')
-        response = model.generate_content([question, image])
+            # Convert PIL image to bytes
+            import io
+            img_bytes = io.BytesIO()
+            image.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+
+            # Use the new API
+            response = client.models.generate_content(
+                model='gemini-2.0-flash-exp',
+                contents=[question, {"mime_type": "image/png", "data": img_bytes.read()}]
+            )
+            answer_text = response.text
+            model_name = 'gemini-2.0-flash-exp'
+
+        except ImportError:
+            # Fallback to deprecated package
+            import google.generativeai as genai
+            genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
+
+            # Use gemini-3.6-flash (latest stable vision model as of 2026)
+            model = genai.GenerativeModel('gemini-3.6-flash')
+            model_name = 'gemini-3.6-flash'
+
+            response = model.generate_content([question, image])
+            answer_text = response.text if hasattr(response, 'text') else str(response)
 
         return {
-            'answer': response.text,
+            'answer': answer_text,
             'confidence': None,  # Gemini doesn't return confidence
-            'model_used': 'gemini-3.6-flash'
+            'model_used': model_name
         }
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Gemini API Error: {error_details}")
         return {'answer': f"Error calling Gemini: {e}", 'confidence': 0, 'model_used': 'gemini'}
 
 
