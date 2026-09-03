@@ -18,7 +18,7 @@ def ask_vision_model(image, question: str, model_type="placeholder"):
     Args:
         image: PIL Image object
         question: Natural language question about the image
-        model_type: "gemini", "claude", "huggingface", "placeholder"
+        model_type: "gemini", "claude", "huggingface", "groq", "placeholder"
 
     Returns:
         dict with:
@@ -44,6 +44,9 @@ def ask_vision_model(image, question: str, model_type="placeholder"):
 
     elif model_type == "huggingface":
         return _call_huggingface(image, question)
+
+    elif model_type == "groq":
+        return _call_groq(image, question)
 
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -147,6 +150,55 @@ def _call_huggingface(image, question):
         return {'answer': f"Error calling HuggingFace: {e}", 'confidence': 0, 'model_used': 'huggingface'}
 
 
+def _call_groq(image, question):
+    """Call Groq API with Llama 3.2 Vision"""
+    try:
+        import os
+        from groq import Groq
+
+        client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+        # Convert image to base64
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+
+        # Call Groq with vision model (using llama-3.2-11b-vision-preview)
+        completion = client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": question
+                        }
+                    ]
+                }
+            ],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+
+        return {
+            'answer': completion.choices[0].message.content,
+            'confidence': None,
+            'model_used': 'llama-3.2-11b-vision'
+        }
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Groq API Error: {error_details}")
+        return {'answer': f"Error calling Groq: {e}", 'confidence': 0, 'model_used': 'groq'}
+
+
 def process_query(image, question: str, model_type="auto"):
     """
     Main entry point for query processing.
@@ -164,7 +216,9 @@ def process_query(image, question: str, model_type="auto"):
 
     # Auto-detect best available model
     if model_type == "auto":
-        if os.environ.get("GOOGLE_API_KEY"):
+        if os.environ.get("GROQ_API_KEY"):
+            model_type = "groq"
+        elif os.environ.get("GOOGLE_API_KEY"):
             model_type = "gemini"
         elif os.environ.get("ANTHROPIC_API_KEY"):
             model_type = "claude"
