@@ -221,4 +221,9 @@ __marimo__/
 uploads/
 *.db
 *.sqlite
+credentials.json
+token.pickle
+*.pickle
+frontend/node_modules/
+frontend/dist/
 

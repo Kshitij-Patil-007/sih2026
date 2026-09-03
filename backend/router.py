@@ -36,6 +36,11 @@ def route_query(question: str, image_count: int | None = None):
         'roads', 'road network', 'streets', 'water bodies', 'waterbodies', 'rivers', 'lakes'
     ]
 
+    feature_keywords = ['road', 'highway', 'street', 'path', 'expressway', 'bridge',
+                        'water', 'river', 'lake', 'canal', 'building', 'structure',
+                        'urban', 'rooftop', 'vegetation', 'forest', 'park', 'crop',
+                        'vehicle', 'car', 'truck', 'ship', 'boat']
+
     ndvi_keywords = ['vegetation', 'ndvi', 'green', 'forest', 'crop', 'agriculture', 'plant']
 
     # Check for fusion queries
@@ -54,11 +59,11 @@ def route_query(question: str, image_count: int | None = None):
             'suggested_action': 'Use detect_changes() with before/after images'
         }
 
-    # Check for feature mapping queries (highlight, detect, find)
-    if any(keyword in question_lower for keyword in mapping_keywords):
+    # Check for feature mapping queries (highlight, detect, find, or direct feature requests like "roads")
+    if any(keyword in question_lower for keyword in mapping_keywords) or any(keyword in question_lower for keyword in feature_keywords):
         return {
             'query_type': 'feature_mapping',
-            'keywords': [kw for kw in mapping_keywords if kw in question_lower],
+            'keywords': [kw for kw in mapping_keywords + feature_keywords if kw in question_lower],
             'suggested_action': 'Use detect_and_highlight() to map and highlight features'
         }
 
