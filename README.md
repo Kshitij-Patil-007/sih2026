@@ -22,26 +22,49 @@ sih2026/
 
 ## 🚀 Quick Start
 
-### Backend Team (You)
+The core pipeline runs locally: feature mapping, land-cover VQA, change detection, and Optical + SAR fusion do not require Groq or any external API key.
+
+### Backend
 
 1. **Install dependencies:**
 ```bash
 py -m pip install -r requirements.txt
 ```
 
-2. **Test the backend:**
+2. **Start the FastAPI server:**
 ```bash
-py test_backend.py
+py -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-3. **Set up API keys (optional for Day 1):**
-```bash
-# Copy the example file
-copy .env.example .env
+The API docs are available at `http://localhost:8000/docs`.
 
-# Edit .env and add your API keys
-notepad .env
+### Frontend
+
+In a second terminal:
+
+```bash
+cd satquery-frontend
+npm install
+npm run dev
 ```
+
+Open the URL printed by Vite. The frontend defaults to `http://127.0.0.1:8000` for the API. To use another backend port, set `VITE_API_BASE` before starting Vite, for example:
+
+```bash
+VITE_API_BASE=http://127.0.0.1:8001 npm run dev
+```
+
+### Test the in-house feature mapper
+
+```bash
+py test_feature_mapping.py
+``` 
+
+The included sample images are in `sample_data/`; try `sample_data/city.png` with queries such as **Highlight all roads** or **Show all water bodies**.
+
+### Optional API keys
+
+Gemini and Claude are optional supplementary integrations. If they are not configured, the in-house models are used automatically. Copy `.env.example` only if you want to configure an optional integration.
 
 ### What Each Module Does
 

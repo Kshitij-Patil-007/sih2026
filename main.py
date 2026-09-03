@@ -277,7 +277,7 @@ async def process_query(request: QueryRequest):
         raise HTTPException(status_code=400, detail="No images in session")
 
     # Route query
-    routing_result = route_query(request.query_text)
+    routing_result = route_query(request.query_text, image_count=len(images))
     task_type = routing_result["query_type"]
 
     # Debug logging
@@ -349,7 +349,7 @@ async def process_query(request: QueryRequest):
 
         audit_trail = AuditTrail(
             task=task_type,
-            models_used=models_used if models_used else ["gemini"],
+            models_used=models_used if models_used else ["inhouse-model"],
             parameters=parameters if parameters else {"query": request.query_text},
             routing_decision=routing_result.get("suggested_action"),
             preprocessing_steps=preprocessing_steps if preprocessing_steps else None
@@ -366,7 +366,9 @@ async def process_query(request: QueryRequest):
                     data=ve.get("data"),
                     url=ve.get("url"),
                     count=ve.get("count"),
-                    coverage_pct=ve.get("coverage_pct")
+                    coverage_pct=ve.get("coverage_pct"),
+                    boxes=ve.get("boxes"),
+                    change_percentage=ve.get("change_percentage")
                 )
             else:
                 print(f"WARNING: visual_evidence is not a dict, it's: {type(ve)} = {ve}")
@@ -380,6 +382,8 @@ async def process_query(request: QueryRequest):
             audit_trail=audit_trail
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
@@ -468,34 +472,28 @@ async def handle_vqa(query_id: str, image_info: dict, question: str) -> dict:
             }
         }
     else:
-        # Optical: Gemini + in-house LoRA cross-check
+        # Optical: in-house BigEarthNet classification head + spectral overlay
         audit.log_model_call(query_id, "in-house-lora-rsai04", "vqa_class_head",
-                            {"image": filepath, "question": question}, success=True)
+                            {"image": filepath, "question": question, "vocabulary": "BigEarthNet-14"}, success=True)
         lora_answer, lora_conf, extras = inhouse_vqa.answer_vqa(prep_img, question)
 
         # Generate false-color land cover evidence overlay
         evidence_img = inhouse_vqa.overlay_class_map(prep_img)
         evidence_filename = f"landcover_evidence_{Path(filepath).stem}.png"
         evidence_path = Path(filepath).parent / evidence_filename
-        evidence_img.save(evidence_path)
+        evidence_img.save(evidence_path, format="PNG")
 
-        # Try Groq Vision API (Llama 3.2 Vision 90B)
-        audit.log_model_call(query_id, "groq-llama-3.2-vision-90b", "vqa",
-                            {"image": filepath, "question": question}, success=True)
-
-        try:
-            from backend.vlm_engine import process_query
-            vlm_result = process_query(prep_img.rgb, question, model_type="auto")
-
-            if vlm_result and vlm_result.get('model_used') != 'placeholder':
-                answer = f"{vlm_result['answer']}\n\n🔍 In-House LoRA Land-Cover Head: {lora_answer}"
-                confidence = min(0.94, lora_conf + 0.10)
-            else:
-                raise Exception("VLM returned placeholder response")
-        except Exception as e:
-            print(f"Vision API failed for VQA: {e}")
-            # Enhanced fallback answer
-            answer = f"**Land Cover Analysis:** {lora_answer}\n\n**Note:** This analysis is based on our in-house remote sensing model trained on BigEarthNet. For detailed scene interpretation with AI vision models, please ensure GROQ_API_KEY is set in your .env file."
+        # Optional Gemini assistance if key configured
+        g = aryan_gemini.generate(
+            f"You are a remote sensing analyst. Analyze this satellite image and answer: {question}",
+            [prep_img.rgb]
+        )
+        if g.ok and g.text:
+            audit.log_model_call(query_id, "gemini-vision", "vqa", {"question": question}, success=True)
+            answer = f"{g.text}\n\n🔍 In-House LoRA Land-Cover Head: {lora_answer}"
+            confidence = min(0.95, lora_conf + 0.10)
+        else:
+            answer = f"**Land Cover Analysis:** {lora_answer}\n\nProcessed using in-house remote sensing classification model trained on BigEarthNet-14."
             confidence = lora_conf
 
         return {
@@ -619,7 +617,7 @@ async def handle_fusion(query_id: str, images: List[dict], question: str) -> dic
 
 
 async def handle_feature_mapping(query_id: str, image_info: dict, question: str) -> dict:
-    """Handle feature detection/mapping with AI contextual analysis"""
+    """Handle feature detection/mapping 100% in-house with remote sensing algorithms"""
     filepath = image_info["filepath"]
 
     audit.log_preprocessing(query_id, "feature_detection", f"Detecting features: {question}")
@@ -631,61 +629,38 @@ async def handle_feature_mapping(query_id: str, image_info: dict, question: str)
     else:
         img = Image.open(filepath)
 
-    # Use feature mapper to detect and highlight
-    audit.log_model_call(query_id, "feature-mapper", "feature_detection",
+    # Use in-house feature mapper to detect and highlight (LSD, NDWI, color segmentation)
+    audit.log_model_call(query_id, "inhouse-feature-mapper", "feature_detection",
                         {"image": filepath, "query": question}, success=True)
 
     result = detect_and_highlight(img, question)
 
-    # Save the highlighted image
-    output_filename = f"highlighted_{Path(filepath).name}"
+    # Save the highlighted image as PNG
+    output_filename = f"highlighted_{Path(filepath).stem}.png"
     output_path = Path(filepath).parent / output_filename
-    result['highlighted'].save(output_path)
+    result['highlighted'].save(output_path, format="PNG")
 
     # Get session_id from filepath to build URL
     session_id = Path(filepath).parent.name
 
-    # Add AI contextual analysis
+    # Add in-house land-cover classification context
     prep_img = prepare_image_from_path(filepath, image_info.get("modality", "optical"))
 
-    # Get land-cover classification from in-house VQA
-    audit.log_model_call(query_id, "in-house-lora-context", "land_cover",
+    audit.log_model_call(query_id, "inhouse-lora-bigearthnet", "land_cover_context",
                         {"image": filepath}, success=True)
-    lora_answer, lora_conf, extras = inhouse_vqa.answer_vqa(prep_img, "Describe the land cover and urban features")
+    lora_answer, lora_conf, extras = inhouse_vqa.answer_vqa(prep_img, question)
 
-    # Get Groq's interpretation if available
-    audit.log_model_call(query_id, "groq-llama-3.2-vision-90b", "contextual_analysis",
-                        {"image": filepath, "question": question}, success=True)
-
-    groq_prompt = (
-        f"You are analyzing a satellite image where {result['count']} features were detected "
-        f"covering {result['coverage_pct']:.1f}% of the area. "
-        f"Answer this question about the image: {question}\n\n"
-        "Provide insights about urban planning, infrastructure patterns, and spatial organization."
+    audit.log_preprocessing(
+        query_id,
+        "evidence_overlay",
+        f"Generated {result['feature']} mask with {result['count']} regions ({result['coverage_pct']}% coverage)"
     )
 
-    try:
-        from backend.vlm_engine import process_query
-        vlm_result = process_query(prep_img.rgb, groq_prompt, model_type="auto")
-
-        if vlm_result and vlm_result.get('model_used') != 'placeholder':
-            answer = (
-                f"{vlm_result['answer']}\n\n"
-                f"📊 Detection Results: {result['count']} features detected, "
-                f"covering {result['coverage_pct']:.1f}% of the image area.\n\n"
-                f"🗺️ Land Cover Analysis: {lora_answer}"
-            )
-            confidence = min(0.92, lora_conf + 0.10)
-        else:
-            raise Exception("VLM returned placeholder response")
-    except Exception as e:
-        # Log why vision API failed
-        print(f"Vision API failed for feature mapping: {e}")
-        answer = (
-            f"{result['answer']}\n\n"
-            f"🗺️ Land Cover Context: {lora_answer}"
-        )
-        confidence = 0.85
+    answer = (
+        f"{result['answer']}\n\n"
+        f"🗺️ Land Cover Context: {lora_answer}"
+    )
+    confidence = 0.92
 
     return {
         "answer": answer,

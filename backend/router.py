@@ -5,7 +5,7 @@ Classifies user queries and routes them to appropriate backend modules
 
 import re
 
-def route_query(question: str):
+def route_query(question: str, image_count: int | None = None):
     """
     Analyze the user's question and determine the query type.
 
@@ -30,8 +30,11 @@ def route_query(question: str):
 
     count_keywords = ['count', 'how many', 'number of', 'quantity', 'total']
 
-    mapping_keywords = ['highlight', 'show me', 'map', 'mark', 'outline', 'detect',
-                        'find', 'locate', 'identify', 'where are', 'where is']
+    mapping_keywords = [
+        'highlight', 'show me', 'show', 'map', 'mark', 'outline', 'detect',
+        'find', 'locate', 'identify', 'where are', 'where is', 'segment', 'extract',
+        'roads', 'road network', 'streets', 'water bodies', 'waterbodies', 'rivers', 'lakes'
+    ]
 
     ndvi_keywords = ['vegetation', 'ndvi', 'green', 'forest', 'crop', 'agriculture', 'plant']
 

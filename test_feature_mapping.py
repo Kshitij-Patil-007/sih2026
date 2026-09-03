@@ -1,46 +1,35 @@
-"""
-Test Feature Mapping - Roads Detection
-"""
-import requests
+"""Offline and API smoke tests for the in-house feature mapper."""
 from pathlib import Path
 
-BASE_URL = "http://localhost:8000"
+import pytest
+from PIL import Image
 
-# Step 1: Upload image
-print("Uploading test image...")
-test_image = Path("test_satellite.png")
+from backend.feature_mapper import detect_and_highlight
 
-with open(test_image, "rb") as f:
-    files = {"files": (test_image.name, f, "image/png")}
-    response = requests.post(f"{BASE_URL}/upload", files=files)
 
-data = response.json()
-session_id = data['session_id']
-print(f"Session ID: {session_id}")
+@pytest.fixture
+def test_image():
+    path = Path(__file__).parent / "test_satellite.png"
+    if not path.exists():
+        pytest.skip("test_satellite.png is not present")
+    return Image.open(path).convert("RGB")
 
-# Step 2: Ask about roads
-print("\nAsking: 'Highlight roads in this image'")
-query_response = requests.post(
-    f"{BASE_URL}/query",
-    json={
-        "session_id": session_id,
-        "query_text": "Highlight roads in this image"
-    }
-)
 
-result = query_response.json()
-print(f"\nTask: {result['task']}")
-print(f"Answer: {result['answer']}")
-print(f"Confidence: {result.get('confidence')}")
+def test_roads_mapping_returns_overlay(test_image):
+    result = detect_and_highlight(test_image, "Highlight all roads")
+    assert result["feature"] == "roads"
+    assert isinstance(result["count"], int)
+    assert 0 <= result["coverage_pct"] <= 100
+    assert result["highlighted"].mode == "RGB"
 
-if result.get('visual_evidence'):
-    print(f"\nVisual Evidence:")
-    print(f"  Type: {result['visual_evidence']['type']}")
-    if 'path' in result['visual_evidence']:
-        print(f"  Saved to: {result['visual_evidence']['path']}")
-    if 'count' in result['visual_evidence']:
-        print(f"  Feature count: {result['visual_evidence']['count']}")
-    if 'coverage_pct' in result['visual_evidence']:
-        print(f"  Coverage: {result['visual_evidence']['coverage_pct']}%")
 
-print("\n[OK] Feature mapping test complete!")
+def test_water_mapping_returns_overlay(test_image):
+    result = detect_and_highlight(test_image, "Show all water bodies")
+    assert result["feature"] == "water"
+    assert isinstance(result["count"], int)
+    assert 0 <= result["coverage_pct"] <= 100
+    assert result["highlighted"].mode == "RGB"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-q"])

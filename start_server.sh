@@ -13,4 +13,4 @@ fi
 # Start server
 echo "Starting server on http://localhost:8000"
 echo "API docs available at http://localhost:8000/docs"
-python main.py
+python -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
