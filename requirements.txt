@@ -33,6 +33,9 @@ google-generativeai>=0.3.0
 # Option 3: Anthropic Claude (API-based)
 anthropic>=0.18.0
 
+# Option 4: Groq (API-based, RECOMMENDED)
+groq>=0.4.0
+
 # Utilities
 python-dotenv>=1.0.0
 python-dateutil>=2.8.2
