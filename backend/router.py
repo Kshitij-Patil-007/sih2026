@@ -23,7 +23,10 @@ def route_query(question: str):
 
     # Keyword patterns for different query types
     change_keywords = ['change', 'difference', 'before', 'after', 'compare', 'temporal',
-                       'evolution', 'growth', 'expansion', 'loss', 'deforestation']
+                       'evolution', 'growth', 'expansion', 'loss', 'deforestation',
+                       'flood', 'damage', 'inundat', 'destroyed', 'delta']
+
+    fusion_keywords = ['fusion', 'fuse', 'optical-sar', 'optical sar', 'sar and optical']
 
     count_keywords = ['count', 'how many', 'number of', 'quantity', 'total']
 
@@ -31,6 +34,14 @@ def route_query(question: str):
                         'find', 'locate', 'identify', 'where are', 'where is']
 
     ndvi_keywords = ['vegetation', 'ndvi', 'green', 'forest', 'crop', 'agriculture', 'plant']
+
+    # Check for fusion queries
+    if any(keyword in question_lower for keyword in fusion_keywords):
+        return {
+            'query_type': 'optical_sar_fusion',
+            'keywords': [kw for kw in fusion_keywords if kw in question_lower],
+            'suggested_action': 'Use dual-encoder Optical-SAR fusion'
+        }
 
     # Check for change detection queries
     if any(keyword in question_lower for keyword in change_keywords):

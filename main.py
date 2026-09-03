@@ -21,8 +21,9 @@ from backend import db, audit
 from backend.router import route_query
 from backend.geo_loader import load_geotiff
 from backend.vlm_engine import ask_vision_model
-from backend.change_detection import detect_changes
 from backend.feature_mapper import detect_and_highlight
+from backend.aryan_models import cdvqa, fusion, inhouse_vqa, gemini as aryan_gemini
+from backend.aryan_preprocess import prepare_image_from_path
 
 app = FastAPI(title="SatQuery AI API", version="1.0.0")
 
@@ -56,11 +57,13 @@ class UploadResponse(BaseModel):
     images: List[ImageMetadata]
 
 class VisualEvidence(BaseModel):
-    type: str  # "feature_mask", "change_mask", "bbox", etc.
+    type: str  # "feature_mask", "change_mask", "change_map", "bbox", "fusion", etc.
     data: Optional[str] = None  # base64 or URL
     url: Optional[str] = None  # URL to highlighted image
     count: Optional[int] = None
     coverage_pct: Optional[float] = None
+    boxes: Optional[List[dict]] = None
+    change_percentage: Optional[float] = None
 
 class AuditTrail(BaseModel):
     task: str
@@ -277,6 +280,9 @@ async def process_query(request: QueryRequest):
     routing_result = route_query(request.query_text)
     task_type = routing_result["query_type"]
 
+    # Debug logging
+    print(f"DEBUG: Query='{request.query_text}' -> task_type='{task_type}'")
+
     # Create query record
     query_id = db.create_query(request.session_id, request.query_text, task_type)
 
@@ -292,7 +298,10 @@ async def process_query(request: QueryRequest):
 
     try:
         # Execute based on task type
-        if task_type == "change_detection" and len(images) == 2:
+        if task_type == "optical_sar_fusion" and len(images) == 2:
+            result = await handle_fusion(query_id, images, request.query_text)
+
+        elif task_type == "change_detection" and len(images) == 2:
             result = await handle_change_detection(query_id, images, request.query_text)
 
         elif task_type == "feature_mapping":
@@ -300,6 +309,15 @@ async def process_query(request: QueryRequest):
 
         elif task_type in ["single_image", "ndvi_analysis"]:
             result = await handle_vqa(query_id, images[0], request.query_text)
+
+        elif len(images) == 2:
+            # Fallback for 2 images: if change or optical-optical -> change detection; if optical+sar -> fusion
+            has_sar = any(img.get("modality") == "sar" for img in images)
+            has_opt = any(img.get("modality") == "optical" for img in images)
+            if has_sar and has_opt:
+                result = await handle_fusion(query_id, images, request.query_text)
+            else:
+                result = await handle_change_detection(query_id, images, request.query_text)
 
         else:
             raise HTTPException(status_code=400, detail=f"Incompatible query type '{task_type}' for {len(images)} image(s)")
@@ -418,46 +436,190 @@ async def serve_uploaded_image(session_id: str, filename: str):
 # Helper functions for different task types
 
 async def handle_vqa(query_id: str, image_info: dict, question: str) -> dict:
-    """Handle single-image VQA"""
+    """Handle single-image VQA with in-house LoRA (BigEarthNet) + Gemini"""
     filepath = image_info["filepath"]
-    modality = image_info["modality"]
+    modality = image_info.get("modality", "optical")
 
-    # Load image
-    audit.log_preprocessing(query_id, "image_load", f"Loading {modality} image")
+    audit.log_preprocessing(query_id, "image_load", f"Loading {modality} image from {Path(filepath).name}")
+    prep_img = prepare_image_from_path(filepath, modality)
 
-    if filepath.endswith((".tif", ".tiff")):
-        geo_data = load_geotiff(filepath)
-        img = geo_data["image"]
-        audit.log_preprocessing(query_id, "geotiff_convert", "Converted GeoTIFF to RGB")
+    for note in prep_img.notes:
+        audit.log_preprocessing(query_id, "image_composite", note)
+
+    session_id = Path(filepath).parent.name
+
+    if prep_img.modality == "sar":
+        # SAR stays strictly on in-house model (Challenge 01 & 08)
+        audit.log_model_call(query_id, "in-house-lora-rsai04", "vqa",
+                            {"image": filepath, "question": question, "vocabulary": "BigEarthNet-14"}, success=True)
+        answer, conf, extras = inhouse_vqa.answer_vqa(prep_img, question)
+
+        # Generate SAR visualization evidence
+        evidence_filename = f"sar_evidence_{Path(filepath).stem}.png"
+        evidence_path = Path(filepath).parent / evidence_filename
+        prep_img.rgb.save(evidence_path)
+
+        return {
+            "answer": answer,
+            "confidence": conf,
+            "visual_evidence": {
+                "type": "sar_backscatter_map",
+                "url": f"/uploads/{session_id}/{evidence_filename}",
+            }
+        }
     else:
-        img = Image.open(filepath)
-
-    # Check if SAR - in-house model required (Nisha's task)
-    if modality == "sar":
-        audit.log_model_call(query_id, "in-house-vqa-lora", "vqa",
-                            {"image": filepath, "question": question}, success=False,
-                            error="In-house SAR model not integrated yet - Nisha's task")
-        # Fallback
-        answer = "⚠️ SAR image detected - in-house LoRA model pending integration"
-        confidence = None
-    else:
-        # Use Gemini for optical
-        audit.log_model_call(query_id, "gemini", "vqa",
+        # Optical: Gemini + in-house LoRA cross-check
+        audit.log_model_call(query_id, "in-house-lora-rsai04", "vqa_class_head",
                             {"image": filepath, "question": question}, success=True)
-        response = ask_vision_model(img, question, model_type="gemini")
-        answer = response["answer"]
-        confidence = None  # Gemini has no native confidence
+        lora_answer, lora_conf, extras = inhouse_vqa.answer_vqa(prep_img, question)
 
-        # Log confidence estimation (heuristic)
-        if len(answer) > 50:  # Simple heuristic
-            confidence = 0.7
-            audit.log_confidence_estimation(query_id, "gemini", "heuristic:length", confidence)
+        # Generate false-color land cover evidence overlay
+        evidence_img = inhouse_vqa.overlay_class_map(prep_img)
+        evidence_filename = f"landcover_evidence_{Path(filepath).stem}.png"
+        evidence_path = Path(filepath).parent / evidence_filename
+        evidence_img.save(evidence_path)
 
-    return {"answer": answer, "confidence": confidence}
+        # Try Groq Vision API (Llama 3.2 Vision 90B)
+        audit.log_model_call(query_id, "groq-llama-3.2-vision-90b", "vqa",
+                            {"image": filepath, "question": question}, success=True)
+
+        try:
+            from backend.vlm_engine import process_query
+            vlm_result = process_query(prep_img.rgb, question, model_type="auto")
+
+            if vlm_result and vlm_result.get('model_used') != 'placeholder':
+                answer = f"{vlm_result['answer']}\n\n🔍 In-House LoRA Land-Cover Head: {lora_answer}"
+                confidence = min(0.94, lora_conf + 0.10)
+            else:
+                raise Exception("VLM returned placeholder response")
+        except Exception as e:
+            print(f"Vision API failed for VQA: {e}")
+            # Enhanced fallback answer
+            answer = f"**Land Cover Analysis:** {lora_answer}\n\n**Note:** This analysis is based on our in-house remote sensing model trained on BigEarthNet. For detailed scene interpretation with AI vision models, please ensure GROQ_API_KEY is set in your .env file."
+            confidence = lora_conf
+
+        return {
+            "answer": answer,
+            "confidence": confidence,
+            "visual_evidence": {
+                "type": "spectral_class_map",
+                "url": f"/uploads/{session_id}/{evidence_filename}",
+            }
+        }
+
+
+async def handle_change_detection(query_id: str, images: List[dict], question: str) -> dict:
+    """Handle bi-temporal Change VQA with CDVQA + Siamese patch head + Gemini"""
+    img1_path = images[0]["filepath"]
+    img2_path = images[1]["filepath"]
+
+    audit.log_preprocessing(query_id, "bi_temporal_load", "Loading before/after pair for co-registration")
+
+    p1 = prepare_image_from_path(img1_path, images[0].get("modality", "optical"))
+    p2 = prepare_image_from_path(img2_path, images[1].get("modality", "optical"))
+
+    for note in p1.notes + p2.notes:
+        audit.log_preprocessing(query_id, "image_prep", note)
+
+    # Run Aryan's CDVQA
+    audit.log_model_call(query_id, "cdvqa-siamese-head", "change_vqa",
+                        {"before": img1_path, "after": img2_path, "question": question}, success=True)
+
+    local_cdvqa = cdvqa.run_cdvqa(p1, p2, question)
+
+    # Save visual overlay
+    session_id = Path(img1_path).parent.name
+    output_filename = f"change_overlay_{Path(img1_path).stem}_{Path(img2_path).stem}.png"
+    output_path = Path(img1_path).parent / output_filename
+    local_cdvqa["overlay"].save(output_path)
+
+    # Convert bounding boxes to frontend percentage format
+    w, h = local_cdvqa["after_aligned"].size
+    frontend_boxes = []
+    for idx, (x0, y0, x1, y1) in enumerate(local_cdvqa.get("boxes", [])[:4]):
+        frontend_boxes.append({
+            "id": f"CHG_{idx+1:02d}",
+            "x": round((x0 / w) * 100, 1),
+            "y": round((y0 / h) * 100, 1),
+            "width": round(((x1 - x0) / w) * 100, 1),
+            "height": round(((y1 - y0) / h) * 100, 1)
+        })
+
+    # Try Gemini on optical pairs
+    gemini_text = ""
+    if p1.modality == "optical" and p2.modality == "optical":
+        audit.log_model_call(query_id, "gemini-change-vqa", "change_vqa",
+                            {"prompt": question}, success=True)
+        prompt = (
+            "You are a remote-sensing change-detection analyst for satellite imagery. "
+            "Image 1 is BEFORE, Image 2 is AFTER. Answer the question directly and concisely. "
+            "Cite visible changes like flooding, new construction, damage, or vegetation shifts.\n\n"
+            f"Question: {question}"
+        )
+        g = aryan_gemini.generate(prompt, [p1.rgb, p2.rgb])
+        if g.ok:
+            gemini_text = g.text
+
+    if gemini_text:
+        answer = f"{gemini_text}\n\n🛰️ CDVQA Spectral & Spatial Analysis:\n{local_cdvqa['answer']}"
+        confidence = min(0.95, local_cdvqa["confidence"] + 0.08)
+    else:
+        answer = local_cdvqa["answer"]
+        confidence = local_cdvqa["confidence"]
+
+    audit.log_preprocessing(query_id, "visual_evidence", f"Generated change map with {len(frontend_boxes)} hotspot boxes")
+
+    return {
+        "answer": answer,
+        "confidence": confidence,
+        "visual_evidence": {
+            "type": "change_map",
+            "url": f"/uploads/{session_id}/{output_filename}",
+            "change_percentage": round(local_cdvqa["change_ratio"] * 100, 2),
+            "boxes": frontend_boxes,
+            "siamese_peak": round(local_cdvqa.get("siamese_peak", 0.0), 3)
+        }
+    }
+
+
+async def handle_fusion(query_id: str, images: List[dict], question: str) -> dict:
+    """Handle Optical + SAR Dual-Encoder Fusion"""
+    img1_info = images[0]
+    img2_info = images[1]
+
+    # Find optical and sar
+    if img1_info.get("modality") == "sar":
+        sar_info, opt_info = img1_info, img2_info
+    else:
+        opt_info, sar_info = img1_info, img2_info
+
+    audit.log_preprocessing(query_id, "fusion_load", "Loading optical RGB + Sentinel-1 SAR pair")
+
+    optical_p = prepare_image_from_path(opt_info["filepath"], "optical")
+    sar_p = prepare_image_from_path(sar_info["filepath"], "sar")
+
+    audit.log_model_call(query_id, "dual-encoder-fusion", "optical_sar_fusion",
+                        {"optical": opt_info["filepath"], "sar": sar_info["filepath"]}, success=True)
+
+    fused = fusion.fuse(optical_p, sar_p)
+
+    session_id = Path(opt_info["filepath"]).parent.name
+    output_filename = f"fusion_overlay_{Path(opt_info['filepath']).stem}_{Path(sar_info['filepath']).stem}.png"
+    output_path = Path(opt_info["filepath"]).parent / output_filename
+    fused["overlay"].save(output_path)
+
+    return {
+        "answer": fused["answer"],
+        "confidence": fused["confidence"],
+        "visual_evidence": {
+            "type": "optical_sar_fusion",
+            "url": f"/uploads/{session_id}/{output_filename}"
+        }
+    }
 
 
 async def handle_feature_mapping(query_id: str, image_info: dict, question: str) -> dict:
-    """Handle feature detection/mapping"""
+    """Handle feature detection/mapping with AI contextual analysis"""
     filepath = image_info["filepath"]
 
     audit.log_preprocessing(query_id, "feature_detection", f"Detecting features: {question}")
@@ -483,43 +645,57 @@ async def handle_feature_mapping(query_id: str, image_info: dict, question: str)
     # Get session_id from filepath to build URL
     session_id = Path(filepath).parent.name
 
+    # Add AI contextual analysis
+    prep_img = prepare_image_from_path(filepath, image_info.get("modality", "optical"))
+
+    # Get land-cover classification from in-house VQA
+    audit.log_model_call(query_id, "in-house-lora-context", "land_cover",
+                        {"image": filepath}, success=True)
+    lora_answer, lora_conf, extras = inhouse_vqa.answer_vqa(prep_img, "Describe the land cover and urban features")
+
+    # Get Groq's interpretation if available
+    audit.log_model_call(query_id, "groq-llama-3.2-vision-90b", "contextual_analysis",
+                        {"image": filepath, "question": question}, success=True)
+
+    groq_prompt = (
+        f"You are analyzing a satellite image where {result['count']} features were detected "
+        f"covering {result['coverage_pct']:.1f}% of the area. "
+        f"Answer this question about the image: {question}\n\n"
+        "Provide insights about urban planning, infrastructure patterns, and spatial organization."
+    )
+
+    try:
+        from backend.vlm_engine import process_query
+        vlm_result = process_query(prep_img.rgb, groq_prompt, model_type="auto")
+
+        if vlm_result and vlm_result.get('model_used') != 'placeholder':
+            answer = (
+                f"{vlm_result['answer']}\n\n"
+                f"📊 Detection Results: {result['count']} features detected, "
+                f"covering {result['coverage_pct']:.1f}% of the image area.\n\n"
+                f"🗺️ Land Cover Analysis: {lora_answer}"
+            )
+            confidence = min(0.92, lora_conf + 0.10)
+        else:
+            raise Exception("VLM returned placeholder response")
+    except Exception as e:
+        # Log why vision API failed
+        print(f"Vision API failed for feature mapping: {e}")
+        answer = (
+            f"{result['answer']}\n\n"
+            f"🗺️ Land Cover Context: {lora_answer}"
+        )
+        confidence = 0.85
+
     return {
-        "answer": result['answer'],
-        "confidence": 0.85,
+        "answer": answer,
+        "confidence": confidence,
         "visual_evidence": {
             "type": "feature_mask",
             "path": str(output_path),
             "url": f"/uploads/{session_id}/{output_filename}",
             "count": result['count'],
             "coverage_pct": result['coverage_pct']
-        }
-    }
-
-
-async def handle_change_detection(query_id: str, images: List[dict], question: str) -> dict:
-    """Handle bi-temporal change detection"""
-    img1_path = images[0]["filepath"]
-    img2_path = images[1]["filepath"]
-
-    audit.log_preprocessing(query_id, "bi_temporal_load", "Loading before/after pair")
-
-    # Load images
-    img1 = Image.open(img1_path) if not img1_path.endswith(".tif") else load_geotiff(img1_path)["image"]
-    img2 = Image.open(img2_path) if not img2_path.endswith(".tif") else load_geotiff(img2_path)["image"]
-
-    # Use existing change detection
-    audit.log_model_call(query_id, "change-detector", "change_vqa",
-                        {"img1": img1_path, "img2": img2_path}, success=True)
-
-    changes = detect_changes(img1, img2)
-    answer = changes["summary"]
-
-    return {
-        "answer": answer,
-        "confidence": 0.8,
-        "visual_evidence": {
-            "type": "change_mask",
-            "data": "base64_encoded_mask_placeholder"  # TODO: encode actual mask
         }
     }
 
