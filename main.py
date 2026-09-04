@@ -9,7 +9,7 @@ load_dotenv()  # Load environment variables from .env file
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from pathlib import Path
 import shutil
@@ -27,10 +27,11 @@ from backend.aryan_preprocess import prepare_image_from_path
 
 app = FastAPI(title="SatQuery AI API", version="1.0.0")
 
-# CORS for React frontend
+# CORS for local development; set CORS_ORIGINS to a comma-separated list in deployment.
+configured_origins = os.getenv("CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5176,http://localhost:5176")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure properly for production
+    allow_origins=[origin.strip() for origin in configured_origins.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,11 +40,19 @@ app.add_middleware(
 # Upload directory
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 10000
+ALLOWED_MODALITIES = {"optical", "sar", "auto"}
 
 # Pydantic models
 class QueryRequest(BaseModel):
-    session_id: str
-    query_text: str
+    session_id: str = Field(min_length=1)
+    query_text: str = Field(min_length=1, max_length=2000)
+
+    def model_post_init(self, __context):
+        self.query_text = self.query_text.strip()
+        if not self.query_text:
+            raise ValueError("query_text must not be blank")
 
 class ImageMetadata(BaseModel):
     id: str
@@ -116,11 +125,12 @@ async def upload_images(
     # Validate file formats
     valid_formats = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
     for file in files:
-        ext = Path(file.filename).suffix.lower()
+        safe_name = Path(file.filename or "image.bin").name
+        ext = Path(safe_name).suffix.lower()
         if ext not in valid_formats:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid format: {file.filename}. Allowed: PNG, JPEG, GeoTIFF"
+                detail=f"Invalid format: {safe_name}. Allowed: PNG, JPEG, GeoTIFF"
             )
 
     # Create session
@@ -130,18 +140,36 @@ async def upload_images(
 
     # Process modality hints if provided
     import json
-    modality_list = json.loads(modality_hints) if modality_hints else [None] * len(files)
+    try:
+        modality_list = json.loads(modality_hints) if modality_hints else ["auto"] * len(files)
+    except (TypeError, json.JSONDecodeError) as exc:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="modality_hints must be a JSON array") from exc
+
+    if not isinstance(modality_list, list) or len(modality_list) != len(files):
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="modality_hints must contain one value per file")
+    modality_list = [str(value).lower() for value in modality_list]
+    if any(value not in ALLOWED_MODALITIES for value in modality_list):
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Each modality hint must be optical, sar, or auto")
 
     images_metadata = []
 
     for idx, (file, modality) in enumerate(zip(files, modality_list)):
-        # Save file
-        filepath = session_dir / file.filename
-        with filepath.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Get image dimensions
+        # Store under a generated basename so client filenames cannot escape the session directory.
+        safe_name = Path(file.filename or f"image_{idx}.bin").name
+        filepath = session_dir / safe_name
         try:
+            file_size = 0
+            with filepath.open("wb") as buffer:
+                while chunk := await file.read(1024 * 1024):
+                    file_size += len(chunk)
+                    if file_size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail=f"{safe_name} exceeds the 25 MB limit")
+                    buffer.write(chunk)
+
+            # Get image dimensions
             if filepath.suffix.lower() in [".tif", ".tiff"]:
                 # GeoTIFF - load with backend
                 geo_data = load_geotiff(str(filepath))
@@ -150,6 +178,10 @@ async def upload_images(
                 img = Image.open(filepath)
 
             width, height = img.size
+            if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+                raise HTTPException(status_code=413, detail=f"{safe_name} exceeds the {MAX_IMAGE_DIMENSION}px dimension limit")
+            img.verify()
+            img = Image.open(filepath)
             format_type = filepath.suffix.lower().replace(".", "")
 
             # Auto-detect modality if not provided
@@ -163,7 +195,7 @@ async def upload_images(
             # Store in database
             image_id = db.add_image(
                 session_id=session_id,
-                filename=file.filename,
+                filename=safe_name,
                 filepath=str(filepath),
                 modality=modality,
                 format=format_type,
@@ -179,8 +211,12 @@ async def upload_images(
                 height=height
             ))
 
+        except HTTPException:
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to process {file.filename}: {str(e)}")
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=f"Failed to process {safe_name}: {str(e)}") from e
 
     return UploadResponse(session_id=session_id, images=images_metadata)
 
@@ -199,11 +235,12 @@ async def upload_simple(
     """
     # Validate file format
     valid_formats = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-    ext = Path(file.filename).suffix.lower()
+    safe_name = Path(file.filename or "image.bin").name
+    ext = Path(safe_name).suffix.lower()
     if ext not in valid_formats:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid format: {file.filename}. Allowed: PNG, JPEG, GeoTIFF"
+            detail=f"Invalid format: {safe_name}. Allowed: PNG, JPEG, GeoTIFF"
         )
 
     # Create session
@@ -211,13 +248,18 @@ async def upload_simple(
     session_dir = UPLOAD_DIR / session_id
     session_dir.mkdir(exist_ok=True)
 
-    # Save file
-    filepath = session_dir / file.filename
-    with filepath.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    # Get image dimensions
+    # Save file under a basename inside this session directory.
+    filepath = session_dir / safe_name
     try:
+        file_size = 0
+        with filepath.open("wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                file_size += len(chunk)
+                if file_size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=f"{safe_name} exceeds the 25 MB limit")
+                buffer.write(chunk)
+
+        # Get image dimensions
         if filepath.suffix.lower() in [".tif", ".tiff"]:
             geo_data = load_geotiff(str(filepath))
             img = geo_data["image"]
@@ -225,6 +267,10 @@ async def upload_simple(
             img = Image.open(filepath)
 
         width, height = img.size
+        if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+            raise HTTPException(status_code=413, detail=f"{safe_name} exceeds the {MAX_IMAGE_DIMENSION}px dimension limit")
+        img.verify()
+        img = Image.open(filepath)
         format_type = filepath.suffix.lower().replace(".", "")
 
         # Auto-detect modality
@@ -236,7 +282,7 @@ async def upload_simple(
         # Store in database
         image_id = db.add_image(
             session_id=session_id,
-            filename=file.filename,
+            filename=safe_name,
             filepath=str(filepath),
             modality=modality,
             format=format_type,
@@ -252,13 +298,17 @@ async def upload_simple(
                 "format": format_type,
                 "width": width,
                 "height": height,
-                "preview_url": f"/uploads/{session_id}/{file.filename}"
+                "preview_url": f"/uploads/{session_id}/{safe_name}"
             },
             "note": "Use this session_id with /query endpoint"
         }
 
+    except HTTPException:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to process {file.filename}: {str(e)}")
+        shutil.rmtree(session_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Failed to process {safe_name}: {str(e)}") from e
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -389,7 +439,7 @@ async def process_query(request: QueryRequest):
         error_trace = traceback.format_exc()
         print(f"ERROR in /query: {error_trace}")
         audit.log_event(query_id, "error", details=str(e))
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}") from e
 
 
 @app.get("/result/{query_id}")
@@ -406,13 +456,11 @@ async def get_result(query_id: str):
 
 @app.get("/report/{query_id}")
 async def generate_report(query_id: str):
-    """Generate PDF report with answer + evidence + audit trail"""
+    """Return a JSON report payload for a completed query."""
     result = db.get_query_result(query_id)
     if not result:
         raise HTTPException(status_code=404, detail="Query not found")
 
-    # TODO: Yatharth will implement PDF generation with ReportLab
-    # For now, return JSON
     audit_trail = audit.get_audit_trail(query_id)
 
     return JSONResponse({
@@ -422,16 +470,16 @@ async def generate_report(query_id: str):
         "answer": result["answer"],
         "confidence": result["confidence"],
         "audit_trail": audit_trail,
-        "note": "PDF generation pending - Yatharth's task"
+        "note": "JSON report generated by SatQuery AI"
     })
 
 
 @app.get("/uploads/{session_id}/{filename}")
 async def serve_uploaded_image(session_id: str, filename: str):
-    """Serve uploaded images for display in browser"""
-    filepath = UPLOAD_DIR / session_id / filename
-
-    if not filepath.exists():
+    """Serve an uploaded image or generated evidence from its session."""
+    session_path = (UPLOAD_DIR / session_id).resolve()
+    filepath = (session_path / Path(filename).name).resolve()
+    if filepath.parent != session_path or not filepath.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
 
     return FileResponse(filepath)

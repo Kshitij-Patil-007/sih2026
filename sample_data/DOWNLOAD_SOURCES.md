@@ -1,5 +1,6 @@
 # Sample Satellite Image Sources
-# Quick links to download real satellite imagery for testing
+
+The checked-in demo images are small, reproducible fixtures for local testing. The links below are optional sources for downloading additional imagery; downloaded files are not automatically part of the repository.
 
 ## Dataset 1: Single Urban/Port Image
 **Option A: NASA Earth Observatory (Easiest)**
@@ -45,7 +46,7 @@
 4. Save to: `C:\Users\Kshitij Patil\projects\helloworld\sih2026\sample_data\`
 
 ### Using Python (automated):
-Run: `py download_samples.py` (I'll create this next)
+Run `py download_samples.py` from the repository root. Review licensing and file sizes before committing any downloaded imagery.
 
 ---
 

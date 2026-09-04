@@ -226,4 +226,15 @@ token.pickle
 *.pickle
 frontend/node_modules/
 frontend/dist/
+satquery-frontend/node_modules/
+satquery-frontend/dist/
+satquery-frontend/.env.local
+
+# Runtime-generated files
+sih_sessions.db
+*.log
+STATUS_SEPT3.md
+sample_data/city2.jpg
+sample_data/india.jpg
+sample_data/test.png
 
